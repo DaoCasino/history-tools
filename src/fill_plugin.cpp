@@ -22,6 +22,7 @@ void fill_plugin::set_program_options(options_description& cli, options_descript
     clop("fill-skip-to,k", bpo::value<uint32_t>(), "Skip blocks before [arg]");
     clop("fill-stop,x", bpo::value<uint32_t>(), "Stop before block [arg]");
     clop("fill-trx", bpo::value<std::vector<std::string>>(), "Filter transactions 'include:status:receiver:act_account:act_name'");
+    clop("last-blocks-to-keep", bpo::value<uint32_t>()->default_value(0), "Clean old blocks except last [arg] (arg > 0; PostgreSQL only)");
 }
 
 void fill_plugin::plugin_initialize(const variables_map& options) {}
