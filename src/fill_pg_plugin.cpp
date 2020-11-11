@@ -44,12 +44,14 @@ struct fpg_session;
 
 struct fill_postgresql_config : connection_config {
     std::string             schema;
-    uint32_t                skip_to       = 0;
-    uint32_t                stop_before   = 0;
-    std::vector<trx_filter> trx_filters   = {};
-    bool                    drop_schema   = false;
-    bool                    create_schema = false;
-    bool                    enable_trim   = false;
+    uint32_t                skip_to               = 0;
+    uint32_t                stop_before           = 0;
+    /// Number of blocks to preserve while cleaning; when 0, no cleaning performed.
+    uint32_t                last_preserved_blocks = 0;
+    std::vector<trx_filter> trx_filters           = {};
+    bool                    drop_schema           = false;
+    bool                    create_schema         = false;
+    bool                    enable_trim           = false;
 };
 
 struct fill_postgresql_plugin_impl : std::enable_shared_from_this<fill_postgresql_plugin_impl> {
@@ -86,6 +88,11 @@ struct fpg_session : connection_callbacks, std::enable_shared_from_this<fpg_sess
     uint32_t                                             first           = 0;
     uint32_t                                             first_bulk      = 0;
     std::map<std::string, std::unique_ptr<table_stream>> table_streams;
+
+    /// Call cleaning procedure every 16 blocks. Used as a mask, should be a (2^n - 1) number.
+    static constexpr uint32_t                            clean_attempt_period_blocks = 0xf;
+
+    //
 
     fpg_session(fill_postgresql_plugin_impl* my)
         : my(my)
@@ -462,6 +469,36 @@ struct fpg_session : connection_callbacks, std::enable_shared_from_this<fpg_sess
         first = std::min(first, head);
     } // truncate
 
+    void clean_old_data(pqxx::work& t, pqxx::pipeline& pipeline, uint32_t last_block_num) const {
+        const uint32_t last_preserved_block_num = last_block_num > config->last_preserved_blocks
+            ? last_block_num - config->last_preserved_blocks
+            : 0;
+
+        if (last_preserved_block_num == 0) {
+            dlog("nothing to clean");
+            return;
+        }
+
+        const auto cleaner = [&](const std::string& name) {
+            pipeline.insert(
+                "delete from " + t.quote_name(config->schema) + "." + t.quote_name(name) +
+                    " where block_num < " + std::to_string(last_preserved_block_num)
+            );
+        };
+        cleaner("received_block");
+        cleaner("action_trace_authorization");
+        cleaner("action_trace_auth_sequence");
+        cleaner("action_trace_ram_delta");
+        cleaner("action_trace");
+        cleaner("transaction_trace");
+        cleaner("block_info");
+    } // clean_old_data
+
+    bool should_clean_data(uint32_t cur_block) const {
+        return config->last_preserved_blocks > 0 &&
+            (cur_block & clean_attempt_period_blocks) == clean_attempt_period_blocks;
+    }
+
     bool received(get_blocks_result_v0& result) override {
         if (!result.this_block)
             return true;
@@ -504,6 +541,10 @@ struct fpg_session : connection_callbacks, std::enable_shared_from_this<fpg_sess
             receive_deltas(result.this_block->block_num, *result.deltas, bulk, t, pipeline);
         if (result.traces)
             receive_traces(result.this_block->block_num, *result.traces, bulk, t, pipeline);
+
+        if (should_clean_data(result.this_block->block_num)) {
+            clean_old_data(t, pipeline, result.this_block->block_num);
+        }
 
         head            = result.this_block->block_num;
         head_id         = (std::string)result.this_block->block_id;
@@ -930,17 +971,18 @@ void fill_pg_plugin::plugin_initialize(const variables_map& options) {
         if (endpoint.find(':') == std::string::npos)
             throw std::runtime_error("invalid endpoint: " + endpoint);
 
-        auto port                 = endpoint.substr(endpoint.find(':') + 1, endpoint.size());
-        auto host                 = endpoint.substr(0, endpoint.find(':'));
-        my->config->host          = host;
-        my->config->port          = port;
-        my->config->schema        = options["pg-schema"].as<std::string>();
-        my->config->skip_to       = options.count("fill-skip-to") ? options["fill-skip-to"].as<uint32_t>() : 0;
-        my->config->stop_before   = options.count("fill-stop") ? options["fill-stop"].as<uint32_t>() : 0;
-        my->config->trx_filters   = fill_plugin::get_trx_filters(options);
-        my->config->drop_schema   = options.count("fpg-drop");
-        my->config->create_schema = options.count("fpg-create");
-        my->config->enable_trim   = options.count("fill-trim");
+        auto port                         = endpoint.substr(endpoint.find(':') + 1, endpoint.size());
+        auto host                         = endpoint.substr(0, endpoint.find(':'));
+        my->config->host                  = host;
+        my->config->port                  = port;
+        my->config->schema                = options["pg-schema"].as<std::string>();
+        my->config->skip_to               = options.count("fill-skip-to") ? options["fill-skip-to"].as<uint32_t>() : 0;
+        my->config->stop_before           = options.count("fill-stop") ? options["fill-stop"].as<uint32_t>() : 0;
+        my->config->last_preserved_blocks = options["last-blocks-to-keep"].as<uint32_t>();
+        my->config->trx_filters           = fill_plugin::get_trx_filters(options);
+        my->config->drop_schema           = options.count("fpg-drop");
+        my->config->create_schema         = options.count("fpg-create");
+        my->config->enable_trim           = options.count("fill-trim");
     }
     FC_LOG_AND_RETHROW()
 }
